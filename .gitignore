@@ -1,0 +1,11 @@
+# Ignore environment files
+.env
+
+# Ignore Firebase & Wallet JSON files
+privateKeys.json
+sches-wallet.json
+dssa-58488-firebase-adminsdk-fbsvc-554c55cdb8.json
+
+# Node modules
+node_modules/
+
