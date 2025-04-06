@@ -52,6 +52,154 @@ function decrypt(encryptedText) {
   return decrypted;
 }
 
+// ----------------- Enhanced SAP Configuration -----------------
+const SAP_MIN_LENGTH = 8;
+const SAP_MAX_ATTEMPTS = 3;
+const SAP_COOLDOWN_MINUTES = 15;
+const SAP_SPECIAL_CHARS = '!@#$%^&*(),.?":{}|<>';
+
+// Helper function to validate SAP strength
+function validateSAPStrength(sap) {
+  if (sap.length < SAP_MIN_LENGTH) {
+    return { valid: false, message: `SAP must be at least ${SAP_MIN_LENGTH} characters long` };
+  }
+  if (!/[A-Z]/.test(sap)) {
+    return { valid: false, message: 'SAP must contain at least one uppercase letter' };
+  }
+  if (!/[a-z]/.test(sap)) {
+    return { valid: false, message: 'SAP must contain at least one lowercase letter' };
+  }
+  if (!/\d/.test(sap)) {
+    return { valid: false, message: 'SAP must contain at least one number' };
+  }
+  if (!/[!@#$%^&*(),.?":{}|<>]/.test(sap)) {
+    return { valid: false, message: 'SAP must contain at least one special character' };
+  }
+  return { valid: true };
+}
+
+
+// Enhanced SAP storage with additional hashing
+async function setUserSAP(userId, sap) {
+  // First validate the SAP
+  const validation = validateSAPStrength(sap);
+  if (!validation.valid) {
+    throw new Error(validation.message);
+  }
+
+  // Create a hash of the SAP for additional security
+  const sapHash = crypto.createHash('sha256').update(sap).digest('hex');
+  
+  // Then encrypt the original SAP
+  const encryptedSap = encrypt(sap);
+
+  const userRef = db.collection('users').doc(userId.toString());
+  await userRef.set({ 
+    sap: encryptedSap,
+    sapHash, // Store hash for verification without decrypting
+    sapAttempts: 0, // Initialize attempt counter
+    sapLastAttempt: null,
+    sapLockedUntil: null
+  }, { merge: true });
+}
+
+// Enhanced SAP verification with attempt tracking
+async function verifyUserSAP(userId, sapAttempt) {
+  const userRef = db.collection('users').doc(userId.toString());
+  const userDoc = await userRef.get();
+  
+  if (!userDoc.exists) return false;
+  const userData = userDoc.data();
+  
+  // Check if SAP is locked
+  if (userData.sapLockedUntil && new Date(userData.sapLockedUntil) > new Date()) {
+    const lockTime = moment(userData.sapLockedUntil).fromNow();
+    throw new Error(`Too many failed attempts. Try again ${lockTime}`);
+  }
+  
+  // First verify using the hash for faster verification
+  const attemptHash = crypto.createHash('sha256').update(sapAttempt).digest('hex');
+  if (attemptHash !== userData.sapHash) {
+    // Increment failed attempts
+    const newAttempts = (userData.sapAttempts || 0) + 1;
+    let updateData = {
+      sapAttempts: newAttempts,
+      sapLastAttempt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    
+    // Lock if too many attempts
+    if (newAttempts >= SAP_MAX_ATTEMPTS) {
+      const lockUntil = new Date(Date.now() + SAP_COOLDOWN_MINUTES * 60 * 1000);
+      updateData.sapLockedUntil = lockUntil;
+    }
+    
+    await userRef.update(updateData);
+    return false;
+  }
+  
+  // If hash matches, verify with the encrypted version
+  const storedSAP = decrypt(userData.sap);
+  if (storedSAP !== sapAttempt) {
+    // This shouldn't happen if hashes match, but just in case
+    await userRef.update({
+      sapAttempts: admin.firestore.FieldValue.increment(1),
+      sapLastAttempt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    return false;
+  }
+  
+  // Reset attempts on successful verification
+  await userRef.update({
+    sapAttempts: 0,
+    sapLockedUntil: null,
+    sapLastAttempt: admin.firestore.FieldValue.serverTimestamp()
+  });
+  
+  return true;
+}
+
+// Enhanced SAP verification prompt
+async function requireSAPVerification(ctx, actionName, callbackData = null) {
+  const userId = ctx.from.id;
+  const userRef = db.collection('users').doc(userId.toString());
+  const userDoc = await userRef.get();
+  
+  if (!userDoc.exists || !userDoc.data().sap) {
+    await ctx.reply(
+      `🔒 <b>SAP Not Set</b>\n\nYou must set a Secure Action Password before performing this action.\n\nPlease set your SAP first in Settings.`,
+      { parse_mode: 'HTML' }
+    );
+    return false;
+  }
+  
+  const userData = userDoc.data();
+  
+  // Check if SAP is locked
+  if (userData.sapLockedUntil && new Date(userData.sapLockedUntil) > new Date()) {
+    const lockTime = moment(userData.sapLockedUntil).fromNow();
+    await ctx.reply(
+      `🔒 <b>SAP Locked</b>\n\nToo many failed attempts. Try again ${lockTime}.`,
+      { parse_mode: 'HTML' }
+    );
+    return false;
+  }
+  
+  ctx.session.awaitingSAP = {
+    action: actionName,
+    attempts: userData.sapAttempts || 0,
+    callbackData: callbackData,
+    messageIds: [] // To track messages to delete
+  };
+  
+  const sapMessage = await ctx.reply(
+    `🔒 <b>SAP Verification Required</b>\n\nTo ${actionName}, please enter your Secure Action Password (${ctx.session.awaitingSAP.attempts + 1}/${SAP_MAX_ATTEMPTS} attempts):`,
+    { parse_mode: 'HTML' }
+  );
+  
+  ctx.session.awaitingSAP.messageIds.push(sapMessage.message_id);
+  return true;
+}
+
 // ----------------- Local Private Keys Storage -----------------
 const PRIVATE_KEYS_FILE = path.join(__dirname, 'privateKeys.json');
 
@@ -161,7 +309,7 @@ function withTimeout(promise, ms) {
 }
 
 // ----------------- Firebase Initialization -----------------
-const serviceAccount = require("./dssa-58488-firebase-adminsdk-fbsvc-554c55cdb8.json");
+const serviceAccount = require("./solana-farasbot-473de-firebase-adminsdk-fbsvc-577282dfdd.json");
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: process.env.FIREBASE_DATABASE_URL,
@@ -641,7 +789,7 @@ async function realTimeBuyAndWithdrawSOL(ctx, netAmount, userSolAddress) {
 
     const solAmount = netAmount / solPrice;
     if (!(await botWalletHasSufficientSOL(solAmount))) {
-      throw new Error('BOT wallet has insufficient SOL balance.');
+      throw new Error('BOT Not send please contact help ceneter @goldmanzack has SOL balance.');
     }
 
     const result = await transferFromBotWallet(solAmount, userSolAddress);
@@ -756,7 +904,7 @@ bot.command('broadcast', async (ctx) => {
   try {
     const userId = ctx.from.id;
     if (!ADMINS.includes(userId)) {
-      await ctx.reply('❌ You do not have permission to use this command.');
+      await ctx.reply('❌ Only admins have permission. You do not have access to use this command..');
       return;
     }
 
@@ -804,7 +952,7 @@ bot.action('confirm_broadcast', async (ctx) => {
 
     for (const doc of usersSnapshot.docs) {
       try {
-        await bot.telegram.sendMessage(doc.id, `📢 <b>Announcement</b>\n\n${ctx.session.broadcastMessage}`, {
+        await bot.telegram.sendMessage(doc.id, `<b>UPDATE BOT ON SOLANA</b>\n\n${ctx.session.broadcastMessage}`, {
           parse_mode: 'HTML'
         });
         successCount++;
@@ -843,7 +991,7 @@ bot.command('stats', async (ctx) => {
   try {
     const userId = ctx.from.id;
     if (!ADMINS.includes(userId)) {
-      await ctx.reply('❌ You do not have permission to use this command.');
+      await ctx.reply('❌ Only admins have permission. You do not have access to use this command.');
       return;
     }
 
@@ -975,23 +1123,8 @@ bot.command('start', async (ctx) => {
         await userRef.set({ referralCode: `ref${userId}` }, { merge: true });
       }
 
-      await ctx.reply(
-        `${greeting}\n\nWelcome to <b>FarasBot on Solana</b> 🚀\nManage your wallet with speed and security.\n\nChoose one of the options below to get started:\n• <b>New Account</b> – Create a new wallet.\n• <b>Import Private Key</b> – Import your existing wallet.\n• <b>Recover Phrase</b> – Recover your wallet using your recovery phrase.`,
-        {
-          parse_mode: 'HTML',
-          ...Markup.inlineKeyboard([
-            [
-              Markup.button.callback('🆕 New Account', 'new_account'),
-              Markup.button.callback('🔑 Import Private Key', 'import_key')
-            ],
-            [
-              Markup.button.callback('🔄 Recover Phrase', 'recover_phrase')
-            ]
-          ])
-        }
-      );
-      return;
-    }
+      
+    };      
 
     if (!userData.referralCode) {
       await userRef.set({ referralCode: `ref${userId}` }, { merge: true });
@@ -1000,7 +1133,7 @@ bot.command('start', async (ctx) => {
     const activeWallet = await getActiveWallet(userId);
     if (!activeWallet) {
       await ctx.reply(
-        `${greeting}\n\nWe found your user profile, but no wallet is associated.\nPlease create or import a wallet below:`,
+        `${greeting}\n\nWelcome to <b>FarasBot on Solana</b>! 🚀\n\nYour gateway to managing your Solana wallet with speed, security, and simplicity. Whether you're new to crypto or an experienced trader, FarasBot keeps you in control.\n\nCreate and manage your wallet effortlessly, obtain SOL, and trade crypto without KYC or central restrictions. You can also purchase SOL using EVC Plus, Zaad, and Sahal, making crypto more accessible in Somalia and East Africa.\n\nFarasBot also includes advanced security features to protect your assets.\n\nStart now:\n\nChoose one of the options below to get started:\n• <b>New Account</b> – Create a new wallet.\n• <b>Import Private Key</b> – Import your existing wallet.\n• <b>Recover Phrase</b> – Recover your wallet using your recovery phrase.\n\n<em>FarasBot offers easy access to your Solana wallet with advanced security features. You can buy SOL using local methods like EVC Plus, Zaad, and Sahal, making crypto accessible in Somalia and East Africa. No KYC, no restrictions—just control at your fingertips. 🚀</em>`,
         {
           parse_mode: 'HTML',
           ...Markup.inlineKeyboard([
@@ -1049,108 +1182,203 @@ bot.command('start', async (ctx) => {
     await ctx.reply('❌ Oops! An error occurred. Please try again later.', { parse_mode: 'HTML' });
   }
 });
-
-// Help Action
 bot.action('help', async (ctx) => {
   try {
-    const helpMessage = `❓ <b>Help & Support</b>\n\nFor any assistance, please contact <b>@userhelp</b>.\nFor withdrawal related inquiries, please contact <b>@userwithdrawal</b>.\n\nPress <b>Back to Main Menu</b> below to return.`;
-    await ctx.editMessageText(helpMessage, {
+    const helpMessage = `<b>Help</b>\n\n` +
+      `<b>Which tokens can I trade?</b>\n` +
+      `Any SPL token that is a SOL pair, on Raydium, pump.fun, Meteora, Moonshot, or Jupiter, and will integrate more platforms on a rolling basis. We pick up pairs instantly, and Jupiter will pick up non-SOL pairs within approx. 15 minutes.\n\n` +
+      `<b>How can I see how much money I've made from referrals?</b>\n` +
+      `Tap the referrals button or type /referrals to see your payment in $BONK!\n\n` +
+      `<b>How do I create a new wallet on BONKbot?</b>\n` +
+      `Tap the Wallet button or type /wallet, and you'll be able to configure your new wallets!\n\n` +
+      `<b>Is BONKbot free? How much do I pay for transactions?</b>\n` +
+      `BONKbot is completely free! We charge 1% on transactions, and keep the bot free so that anyone can use it.\n\n` +
+      `<b>Why is my Net Profit lower than expected?</b>\n` +
+      `Your Net Profit is calculated after deducting all associated costs, including Price Impact, Transfer Tax, Dex Fees, and a 1% BONKbot fee. This ensures the figure you see is what you actually receive, accounting for all transaction-related expenses.\n\n` +
+      `<b>Is there a difference between @FARASbotChat and the backup bots?</b>\n` +
+      `No, they are all the same bot and you can use them interchangeably. If one is slow or down, you can use the other ones. You will have access to the same wallet and positions.\n\n` +
+      `<b>Further questions?</b> Join our Telegram group: <a href="https://t.me/FARASbotChat">FARASbotChat</a>`;
+
+    await ctx.reply(helpMessage, {
       parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('🔙 Back to Main Menu', 'back_to_main')]
-      ])
+      reply_markup: {
+        inline_keyboard: [
+          [
+            
+            { text: 'VIEW CHANNEL', url: 'https://t.me/FARASbotChat' }
+          ],
+          [
+            { text: 'Close', callback_data: 'close_help' }
+          ]
+        ]
+      }
     });
-    ctx.answerCbQuery();
+
+    await ctx.answerCbQuery();
   } catch (error) {
     console.error('❌ Help Action Error:', error);
     await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
   }
 });
 
+// Close help message handler
+bot.action('close_help', async (ctx) => {
+  try {
+    await ctx.deleteMessage();
+    await ctx.answerCbQuery();
+  } catch (error) {
+    console.error('❌ Error closing help message:', error);
+  }
+});
+
+
+
 // Referral Friends
+// Referral Friends Action - Improved Version
 bot.action('referral_friends', async (ctx) => {
   try {
     const userId = ctx.from.id;
-    const botUsername = ctx.me || 'YourBotUsername';
+    const botUsername = 'solana_farasbot'; // Fixed bot username
 
     const stats = await getUserReferralStatsMultiLevel(userId, botUsername);
     if (!stats.code) {
-      return ctx.reply('❌ No referral info found. Type /start to create an account first.', { parse_mode: 'HTML' });
+      return ctx.reply('❌ No referral info found. Type /start to create an account first.', { 
+        parse_mode: 'HTML' 
+      });
     }
 
+    // Format the referral link properly
+    const referralLink = `https://t.me/${botUsername}?start=${stats.code}`;
+    
     const solPrice = await getSolPrice() || 20;
     const totalRewardsUSD = (stats.totalRewards * solPrice).toFixed(2);
     const totalPaidUSD = (stats.totalPaid * solPrice).toFixed(2);
     const totalUnpaidUSD = (stats.totalUnpaid * solPrice).toFixed(2);
-
     const totalRefCount = stats.directCount + stats.indirectCount;
 
-    const messageText =
-`<b>YOUR REFERRALS (updated every 30 min)</b>
+    const messageText = 
+`✨ <b>YOUR REFERRAL DASHBOARD</b> ✨
+<i>Updated every 30 minutes</i>
 
-• <b>Users referred:</b> ${totalRefCount} (direct: ${stats.directCount}, indirect: ${stats.indirectCount})
-• <b>Total rewards:</b> ${stats.totalRewards.toFixed(4)} SOL ($${totalRewardsUSD})
-• <b>Total paid:</b> ${stats.totalPaid.toFixed(4)} SOL ($${totalPaidUSD})
-• <b>Total unpaid:</b> ${stats.totalUnpaid.toFixed(4)} SOL ($${totalUnpaidUSD})
+━━━━━━━━━━━━━━━━━━━
+👥 <b>YOUR NETWORK</b>
+┣ Direct Referrals: <b>${stats.directCount}</b>
+┗ Indirect Referrals: <b>${stats.indirectCount}</b>
 
-<b>Your Reflink:</b>
-<code>${stats.link}</code>
+💰 <b>YOUR EARNINGS</b>
+┣ Total Rewards: <b>${stats.totalRewards.toFixed(4)} SOL</b> ($${totalRewardsUSD})
+┣ Paid Out: <b>${stats.totalPaid.toFixed(4)} SOL</b> ($${totalPaidUSD})
+┗ Pending: <b>${stats.totalUnpaid.toFixed(4)} SOL</b> ($${totalUnpaidUSD})
 
-Refer your friends and earn 30% of their fees in the first month, 20% in the second, and 10% forever!
-`;
+🔗 <b>YOUR REFERRAL LINK</b>
+<code>${referralLink}</code>
+
+🎁 <b>HOW IT WORKS</b>
+When friends use your link:
+┣ 1st Month: You earn <b>30%</b> of their fees
+┣ 2nd Month: You earn <b>20%</b> of their fees
+┗ Ongoing: You earn <b>10%</b> forever!
+
+💡 <i>Share your link below to start earning!</i>`;
+
 
     await ctx.reply(messageText, {
       parse_mode: 'HTML',
       ...Markup.inlineKeyboard([
         [
           Markup.button.callback('📷 QR Code', 'referral_qrcode'),
+          Markup.button.callback('📤 Share', 'share_referral'),
           Markup.button.callback('❌ Close', 'close_referral_message')
         ]
       ])
     });
 
-    ctx.answerCbQuery();
+    await ctx.answerCbQuery();
   } catch (error) {
     console.error('❌ referral_friends Error:', error);
-    await ctx.reply('❌ An error occurred while fetching referral data.', { parse_mode: 'HTML' });
+    await ctx.reply('❌ An error occurred while fetching referral data.', { 
+      parse_mode: 'HTML' 
+    });
   }
 });
 
-// Action to show the QR Code
+// Action to show the QR Code - Improved Version
 bot.action('referral_qrcode', async (ctx) => {
   try {
     const userId = ctx.from.id;
-    const botUsername = ctx.me || 'YourBotUsername';
+    const botUsername = 'solana_farasbot'; // Fixed bot username
 
     const stats = await getUserReferralStatsMultiLevel(userId, botUsername);
     if (!stats.code) {
-      return ctx.reply('❌ No referral info found. Type /start to create an account first.', { parse_mode: 'HTML' });
+      return ctx.reply('❌ No referral info found.', { parse_mode: 'HTML' });
     }
 
-    const options = {
+    const referralLink = `https://t.me/${botUsername}?start=${stats.code}`;
+    
+    // Generate high-quality QR code
+    const qrBuffer = await QRCode.toBuffer(referralLink, {
       errorCorrectionLevel: 'H',
-      type: 'image/png',
-      width: 300,
-    };
-
-    const qrBuffer = await QRCode.toBuffer(stats.link, options);
-
-    await ctx.replyWithPhoto({ source: qrBuffer, filename: 'qrcode.png' }, {
-      caption: `Here is your referral QR code!\n\n<code>${stats.link}</code>`,
-      parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('❌ Close', 'close_referral_qr')]
-      ])
+      type: 'png',
+      width: 400,
+      margin: 2,
+      color: {
+        dark: '#000000', // Black dots
+        light: '#ffffff' // White background
+      }
     });
 
-    ctx.answerCbQuery();
+    await ctx.replyWithPhoto(
+      { source: qrBuffer, filename: 'referral_qr.png' }, 
+      {
+        caption: `🔗 <b>Your Referral QR Code</b>\n\nScan this code to join with your referral link:\n<code>${referralLink}</code>`,
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('🔙 Back', 'referral_friends'),
+          Markup.button.callback('❌ Close', 'close_referral_qr')]
+        ])
+      }
+    );
+
+    await ctx.answerCbQuery();
   } catch (error) {
     console.error('❌ referral_qrcode Error:', error);
-    await ctx.reply('❌ An error occurred while generating QR code.', { parse_mode: 'HTML' });
+    await ctx.reply('❌ Failed to generate QR code. Please try again.', { 
+      parse_mode: 'HTML' 
+    });
   }
 });
 
-// Action to close the main referral text
+// Share referral link action
+bot.action('share_referral', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const botUsername = 'solana_farasbot';
+    const stats = await getUserReferralStatsMultiLevel(userId, botUsername);
+    
+    if (stats.code) {
+      const referralLink = `https://t.me/${botUsername}?start=${stats.code}`;
+      await ctx.reply(
+        `📤 <b>Share Your Referral Link</b>\n\n` +
+        `Copy this message to share with friends:\n\n` +
+        `Join me on Solana FarasBot and get bonus rewards! 🚀\n` +
+        `Use my referral link: ${referralLink}`,
+        {
+          parse_mode: 'HTML',
+          ...Markup.inlineKeyboard([
+            [Markup.button.switchToChat('💬 Share Now', 'Join FarasBot with my link!')],
+            [Markup.button.callback('🔙 Back', 'referral_friends')]
+          ])
+        }
+      );
+    }
+    await ctx.answerCbQuery();
+  } catch (error) {
+    console.error('❌ share_referral Error:', error);
+    await ctx.answerCbQuery('❌ Failed to prepare sharing. Try again.');
+  }
+});
+
+// Close handlers (unchanged)
 bot.action('close_referral_message', async (ctx) => {
   try {
     await ctx.deleteMessage();
@@ -1160,7 +1388,6 @@ bot.action('close_referral_message', async (ctx) => {
   }
 });
 
-// Action to close the QR code
 bot.action('close_referral_qr', async (ctx) => {
   try {
     await ctx.deleteMessage();
@@ -1228,6 +1455,140 @@ bot.action('recover_phrase', async (ctx) => {
 // Text Handler
 bot.on('text', async (ctx) => {
   try {
+    // SAP Verification Flow
+    if (ctx.session.awaitingSAP) {
+      const sapAttempt = ctx.message.text.trim();
+      const userId = ctx.from.id;
+      
+      // Immediately delete the password message
+      try {
+        await ctx.deleteMessage();
+      } catch (deleteError) {
+        console.log('Could not delete password message:', deleteError);
+      }
+      
+      // Also delete previous SAP prompt messages
+      for (const msgId of ctx.session.awaitingSAP.messageIds) {
+        try {
+          await ctx.deleteMessage(msgId);
+        } catch (e) {
+          console.log('Could not delete message:', e);
+        }
+      }
+      
+      try {
+        const isValid = await verifyUserSAP(userId, sapAttempt);
+        
+        if (!isValid) {
+          const remainingAttempts = SAP_MAX_ATTEMPTS - (ctx.session.awaitingSAP.attempts + 1);
+          
+          if (remainingAttempts <= 0) {
+            await ctx.reply(
+              '🔒 <b>SAP Locked</b>\n\nToo many failed attempts. Please try again later.',
+              { parse_mode: 'HTML' }
+            );
+            delete ctx.session.awaitingSAP;
+            return;
+          }
+          
+          const newMessage = await ctx.reply(
+            `❌ <b>Invalid SAP</b>\n\nAttempts remaining: ${remainingAttempts}\n\nPlease try again:`,
+            { parse_mode: 'HTML' }
+          );
+          
+          ctx.session.awaitingSAP.attempts++;
+          ctx.session.awaitingSAP.messageIds = [newMessage.message_id];
+          return;
+        }
+        
+        // SAP verified - proceed with the action
+        const { action, callbackData } = ctx.session.awaitingSAP;
+        delete ctx.session.awaitingSAP;
+        
+        await handleVerifiedAction(ctx, action, callbackData);
+        
+      } catch (error) {
+        console.error('SAP verification error:', error);
+        await ctx.reply(
+          `❌ ${error.message || 'SAP verification failed'}`,
+          { parse_mode: 'HTML' }
+        );
+      }
+      return;
+    }
+
+    // SAP Setting Flow
+    if (ctx.session.awaitingNewSAP) {
+      const newSAP = ctx.message.text.trim();
+      
+      try {
+        // Clean up previous messages
+        if (ctx.session.sapSetupMessageId) {
+          await ctx.deleteMessage(ctx.session.sapSetupMessageId);
+        }
+        await ctx.deleteMessage();
+      } catch (e) {
+        console.log('Could not delete messages:', e);
+      }
+      
+      try {
+        await setUserSAP(ctx.from.id, newSAP);
+        await ctx.reply(
+          '✅ Secure Action Password set successfully!\n\nYou can now use it to verify sensitive actions.',
+          { parse_mode: 'HTML' }
+        );
+      } catch (error) {
+        await ctx.reply(
+          `❌ ${error.message}\n\nPlease try again with a stronger password.`,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+      
+      delete ctx.session.awaitingNewSAP;
+      delete ctx.session.sapSetupMessageId;
+      return;
+    }
+    
+    // SAP Change Flow - Current SAP
+    if (ctx.session.awaitingCurrentSAP) {
+      const currentSAP = ctx.message.text.trim();
+      
+      try {
+        // Clean up previous messages
+        if (ctx.session.sapChangeMessageId) {
+          await ctx.deleteMessage(ctx.session.sapChangeMessageId);
+        }
+        await ctx.deleteMessage();
+      } catch (e) {
+        console.log('Could not delete messages:', e);
+      }
+      
+      try {
+        const isValid = await verifyUserSAP(ctx.from.id, currentSAP);
+        if (!isValid) {
+          throw new Error('Incorrect current SAP');
+        }
+        
+        ctx.session.awaitingNewSAP = true;
+        delete ctx.session.awaitingCurrentSAP;
+        
+        const message = await ctx.reply(
+          '✅ Current SAP verified. Now enter your new SAP:',
+          { parse_mode: 'HTML' }
+        );
+        
+        ctx.session.sapSetupMessageId = message.message_id;
+        
+      } catch (error) {
+        await ctx.reply(
+          `❌ ${error.message || 'SAP verification failed'}`,
+          { parse_mode: 'HTML' }
+        );
+      }
+      return;
+    }
+
     // Importing Private Key Flow
     if (ctx.session.awaitingPrivateKey) {
       const text = ctx.message.text.trim();
@@ -1276,85 +1637,84 @@ bot.on('text', async (ctx) => {
       return;
     }
 
-    // Sending SOL Flow
-    if (ctx.session.sendFlow) {
-      if (ctx.session.sendFlow.action === 'awaiting_address') {
-        const toAddress = ctx.message.text.trim();
-        if (!isValidSolanaAddress(toAddress)) {
-          await ctx.reply('❌ Invalid SOL address. Please try again.', { parse_mode: 'HTML' });
-          return;
-        }
-        ctx.session.sendFlow.action = 'awaiting_amount';
-        ctx.session.sendFlow.toAddress = toAddress;
-        await ctx.reply('💰 Enter the USD amount you want to send (minimum $1):', { parse_mode: 'HTML' });
-        return;
-      } else if (ctx.session.sendFlow.action === 'awaiting_amount') {
-        const amountUSD = parseFloat(ctx.message.text);
-        if (isNaN(amountUSD) || amountUSD < 1) {
-          await ctx.reply('❌ Please enter a valid amount (minimum $1).', { parse_mode: 'HTML' });
-          return;
-        }
-        const solPrice = await getSolPrice();
-        if (!solPrice) {
-          await ctx.reply('❌ Unable to fetch SOL price. Try again later.', { parse_mode: 'HTML' });
-          return;
-        }
-        const amountSOL = amountUSD / solPrice;
-        ctx.session.sendFlow.amountSOL = amountSOL;
-        ctx.session.sendFlow.amountUSD = amountUSD;
-        await ctx.reply(
-          `⚠️ Confirm:\nSend <b>${amountSOL.toFixed(4)} SOL</b> (≈ $${amountUSD.toFixed(2)}) to:\n<code>${ctx.session.sendFlow.toAddress}</code>`,
-          {
-            parse_mode: 'HTML',
-            ...Markup.inlineKeyboard([
-              [Markup.button.callback('✅ Confirm', 'confirm_send'),
-               Markup.button.callback('❌ Cancel', 'cancel_send')]
-            ])
-          }
-        );
+    // Sending SOL Flow - Address Input
+    if (ctx.session.sendFlow && ctx.session.sendFlow.action === 'awaiting_address') {
+      const toAddress = ctx.message.text.trim();
+      if (!isValidSolanaAddress(toAddress)) {
+        await ctx.reply('❌ Invalid SOL address. Please try again.', { parse_mode: 'HTML' });
         return;
       }
+      ctx.session.sendFlow.action = 'awaiting_amount';
+      ctx.session.sendFlow.toAddress = toAddress;
+      await ctx.reply('💰 Enter the USD amount you want to send (minimum $1):', { parse_mode: 'HTML' });
+      return;
+    } 
+    // Sending SOL Flow - Amount Input
+    else if (ctx.session.sendFlow && ctx.session.sendFlow.action === 'awaiting_amount') {
+      const amountUSD = parseFloat(ctx.message.text);
+      if (isNaN(amountUSD) || amountUSD < 1) {
+        await ctx.reply('❌ Please enter a valid amount (minimum $1).', { parse_mode: 'HTML' });
+        return;
+      }
+      const solPrice = await getSolPrice();
+      if (!solPrice) {
+        await ctx.reply('❌ Unable to fetch SOL price. Try again later.', { parse_mode: 'HTML' });
+        return;
+      }
+      const amountSOL = amountUSD / solPrice;
+      ctx.session.sendFlow.amountSOL = amountSOL;
+      ctx.session.sendFlow.amountUSD = amountUSD;
+      await ctx.reply(
+        `⚠️ Confirm:\nSend <b>${amountSOL.toFixed(4)} SOL</b> (≈ $${amountUSD.toFixed(2)}) to:\n<code>${ctx.session.sendFlow.toAddress}</code>`,
+        {
+          parse_mode: 'HTML',
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm', 'confirm_send'),
+             Markup.button.callback('❌ Cancel', 'cancel_send')]
+          ])
+        }
+      );
+      return;
     }
 
-    // Cash Buy Flow
-    if (ctx.session.cashBuy) {
-      const cashBuy = ctx.session.cashBuy;
-      if (cashBuy.step === 'phoneNumber') {
-        const phoneNumber = ctx.message.text.trim();
-        if (!/^\d{9}$/.test(phoneNumber)) {
-          await ctx.reply('❌ Invalid phone number. Please enter a 9-digit number.', { parse_mode: 'HTML' });
-          return;
-        }
-        cashBuy.phoneNumber = phoneNumber;
-        cashBuy.step = 'amount';
-        await ctx.reply('Enter the USD amount you wish to purchase:', { parse_mode: 'HTML' });
-        return;
-      } else if (cashBuy.step === 'amount') {
-        const amount = parseFloat(ctx.message.text);
-        if (isNaN(amount) || amount < 1 || amount > 5000) {
-          await ctx.reply('❌ Please enter a valid amount (minimum $2 and maximum $5000).', { parse_mode: 'HTML' });
-          return;
-        }
-        cashBuy.amount = amount;
-        cashBuy.step = 'confirm';
-        const fee = amount * 0.05;
-        const netAmount = amount - fee;
-        const solPrice = await getSolPrice();
-        const solReceived = solPrice ? (netAmount / solPrice) : 0;
-        await ctx.reply(
-          `*Deposit Details:*\n\n• Phone Number: ${cashBuy.phoneNumber}\n• Deposit Amount: $${amount.toFixed(2)}\n• Fee: $${fee.toFixed(2)}\n• Total After Fee: $${netAmount.toFixed(2)}\n• You will receive ≈ ${solReceived.toFixed(4)} SOL\n\nProceed?`,
-          {
-            parse_mode: 'HTML',
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '✅ Submit', callback_data: 'submit' },
-                 { text: '❌ Cancel', callback_data: 'cancel' }]
-              ]
-            }
-          }
-        );
+    // Cash Buy Flow - Phone Number Input
+    if (ctx.session.cashBuy && ctx.session.cashBuy.step === 'phoneNumber') {
+      const phoneNumber = ctx.message.text.trim();
+      if (!/^\d{9}$/.test(phoneNumber)) {
+        await ctx.reply('❌ Invalid phone number. Please enter a 9-digit number.', { parse_mode: 'HTML' });
         return;
       }
+      ctx.session.cashBuy.phoneNumber = phoneNumber;
+      ctx.session.cashBuy.step = 'amount';
+      await ctx.reply('Enter the USD amount you wish to purchase:', { parse_mode: 'HTML' });
+      return;
+    } 
+    // Cash Buy Flow - Amount Input
+    else if (ctx.session.cashBuy && ctx.session.cashBuy.step === 'amount') {
+      const amount = parseFloat(ctx.message.text);
+      if (isNaN(amount) || amount < 1 || amount > 5000) {
+        await ctx.reply('❌ Please enter a valid amount (minimum $2 and maximum $5000).', { parse_mode: 'HTML' });
+        return;
+      }
+      ctx.session.cashBuy.amount = amount;
+      ctx.session.cashBuy.step = 'confirm';
+      const fee = amount * 0.05;
+      const netAmount = amount - fee;
+      const solPrice = await getSolPrice();
+      const solReceived = solPrice ? (netAmount / solPrice) : 0;
+      await ctx.reply(
+        `*Deposit Details:*\n\n• Phone Number: ${ctx.session.cashBuy.phoneNumber}\n• Deposit Amount: $${amount.toFixed(2)}\n• Fee: $${fee.toFixed(2)}\n• Total After Fee: $${netAmount.toFixed(2)}\n• You will receive ≈ ${solReceived.toFixed(4)} SOL\n\nProceed?`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '✅ Submit', callback_data: 'submit' },
+               { text: '❌ Cancel', callback_data: 'cancel' }]
+            ]
+          }
+        }
+      );
+      return;
     }
   } catch (error) {
     console.error('❌ Text Handler Error:', error);
@@ -1362,43 +1722,78 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// Refresh Balance
-bot.action('refresh', async (ctx) => {
+async function handleVerifiedAction(ctx, action, callbackData) {
+  switch (action) {
+    case 'view private key':
+      await handleViewPrivateKey(ctx);
+      break;
+    case 'reset wallet':
+      await handleResetWallet(ctx);
+      break;
+    case 'confirm withdrawal':
+      await handleWithdrawal(ctx);
+      break;
+    // Add other actions as needed
+    default:
+      await ctx.reply(`✅ SAP verified. Continuing with ${action}...`, { parse_mode: 'HTML' });
+      if (callbackData) {
+        // Handle callback data if needed
+      }
+  }
+}
+
+async function handleViewPrivateKey(ctx) {
   try {
     const userId = ctx.from.id;
     const activeWallet = await getActiveWallet(userId);
     if (!activeWallet) {
-      return ctx.reply('❌ No active wallet found. Use /start to create or import a wallet.', { parse_mode: 'HTML' });
+      throw new Error('No active wallet found');
     }
-    const balance = await connection.getBalance(new PublicKey(activeWallet.publicKey));
-    const balanceSOL = balance / 1e9;
-    const solPrice = await getSolPrice();
-    const balanceUSD = (balanceSOL * solPrice).toFixed(2);
-    await ctx.reply(`🔄 Balance: <b>${balanceSOL.toFixed(4)} SOL</b> (~$${balanceUSD} USD)`, { parse_mode: 'HTML' });
-  } catch (error) {
-    console.error('❌ Refresh Balance Error:', error);
-    await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
-  }
-});
-
-// Withdrawal
-bot.action('withdrawal', async (ctx) => {
-  try {
-    ctx.session.sendFlow = { action: 'awaiting_address' };
-    await ctx.reply('📤 Enter the recipient SOL address:', { parse_mode: 'HTML' });
-  } catch (error) {
-    console.error('❌ Withdrawal Action Error:', error);
-    await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
-  }
-});
-
-// Confirm Send
-bot.action('confirm_send', async (ctx) => {
-  try {
-    if (!ctx.session.sendFlow || !ctx.session.sendFlow.toAddress) {
-      await ctx.reply('❌ Transaction not initiated properly.', { parse_mode: 'HTML' });
-      return;
+    
+    const storedPrivateKey = getLocalPrivateKey(activeWallet.id);
+    if (!storedPrivateKey) {
+      throw new Error('Private key not available');
     }
+    
+    // Send private key with auto-deletion
+    const keyMessage = await ctx.reply(
+      `🔐 <b>Your Private Key</b>\n\n<code>${storedPrivateKey}</code>\n\n⚠️ This message will self-destruct in 30 seconds.`,
+      { parse_mode: 'HTML' }
+    );
+    
+    // Delete after 30 seconds
+    setTimeout(async () => {
+      try {
+        await ctx.deleteMessage(keyMessage.message_id);
+        await ctx.reply('🔐 Private key message has been deleted for security.', { parse_mode: 'HTML' });
+      } catch (e) {
+        console.error('Could not delete private key message:', e);
+      }
+    }, 30000);
+    
+  } catch (error) {
+    console.error('View private key error:', error);
+    await ctx.reply(`❌ ${error.message || 'Failed to retrieve private key'}`, { parse_mode: 'HTML' });
+  }
+}
+
+async function handleResetWallet(ctx) {
+  try {
+    const userId = ctx.from.id;
+    const newWallet = await resetWallet(userId);
+    
+    await ctx.reply(
+      `✅ <b>Wallet Reset Successful!</b>\n\nA brand-new wallet has been created.\n<b>New Address:</b> ${newWallet.publicKey}\n\nYour old wallet has been discarded. Type /start to continue.`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (error) {
+    console.error('Reset wallet error:', error);
+    await ctx.reply(`❌ ${error.message || 'Failed to reset wallet'}`, { parse_mode: 'HTML' });
+  }
+}
+
+async function handleWithdrawal(ctx) {
+  try {
     const userId = ctx.from.id;
     const activeWallet = await getActiveWallet(userId);
     if (!activeWallet) {
@@ -1406,6 +1801,7 @@ bot.action('confirm_send', async (ctx) => {
       ctx.session.sendFlow = null;
       return;
     }
+    
     const storedPrivateKey = getLocalPrivateKey(activeWallet.id);
     if (!storedPrivateKey) {
       await ctx.reply('❌ Private key missing. Please import your wallet using /import_key.', { parse_mode: 'HTML' });
@@ -1464,12 +1860,67 @@ bot.action('confirm_send', async (ctx) => {
     );
     ctx.session.sendFlow = null;
   } catch (error) {
-    console.error('❌ Confirm Send Error:', error);
-    if (error.message && error.message.includes("insufficient funds for rent")) {
-      await ctx.reply('❌ Transaction failed due to insufficient funds for fees.', { parse_mode: 'HTML' });
-    } else {
-      await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
+    console.error('Withdrawal error:', error);
+    await ctx.reply(`❌ ${error.message || 'Withdrawal failed'}`, { parse_mode: 'HTML' });
+    ctx.session.sendFlow = null;
+  }
+}
+
+// Refresh Balance
+bot.action('refresh', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const activeWallet = await getActiveWallet(userId);
+    if (!activeWallet) {
+      return ctx.reply('❌ No active wallet found. Use /start to create or import a wallet.', { parse_mode: 'HTML' });
     }
+    const balance = await connection.getBalance(new PublicKey(activeWallet.publicKey));
+    const balanceSOL = balance / 1e9;
+    const solPrice = await getSolPrice();
+    const balanceUSD = (balanceSOL * solPrice).toFixed(2);
+    await ctx.reply(`🔄 Balance: <b>${balanceSOL.toFixed(4)} SOL</b> (~$${balanceUSD} USD)`, { parse_mode: 'HTML' });
+  } catch (error) {
+    console.error('❌ Refresh Balance Error:', error);
+    await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
+  }
+});
+
+// Withdrawal
+bot.action('withdrawal', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const userRef = db.collection('users').doc(userId.toString());
+    const userDoc = await userRef.get();
+    
+    if (!userDoc.exists || !userDoc.data().sap) {
+      await ctx.reply(
+        `🔒 <b>SAP Not Set</b>\n\nYou must set a Secure Action Password before making withdrawals.\n\nPlease set your SAP first in Settings.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+    
+    ctx.session.sendFlow = { action: 'awaiting_address' };
+    await ctx.reply('📤 Enter the recipient SOL address:', { parse_mode: 'HTML' });
+  } catch (error) {
+    console.error('❌ Withdrawal Action Error:', error);
+    await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
+  }
+});
+
+// Confirm Send (now triggers SAP verification)
+bot.action('confirm_send', async (ctx) => {
+  try {
+    if (!ctx.session.sendFlow || !ctx.session.sendFlow.toAddress) {
+      await ctx.reply('❌ Transaction not initiated properly.', { parse_mode: 'HTML' });
+      return;
+    }
+    
+    await requireSAPVerification(ctx, 'confirm withdrawal');
+    await ctx.answerCbQuery();
+  } catch (error) {
+    console.error('❌ Confirm Send Error:', error);
+    await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
   }
 });
 
@@ -1568,6 +2019,10 @@ Minimum Position Value: Minimum position value to show in portfolio. Will hide t
             Markup.button.callback('🗄️ Manage Wallet', 'manage_wallet')
           ],
           [
+            Markup.button.callback('🔒 Set SAP', 'set_sap'),
+            Markup.button.callback('🔄 Change SAP', 'change_sap')
+          ],
+          [
             Markup.button.callback('🚨 Reset Wallet', 'reset_wallet_prompt'),
             Markup.button.callback('🔙 Back to Main Menu', 'back_to_main')
           ]
@@ -1580,18 +2035,32 @@ Minimum Position Value: Minimum position value to show in portfolio. Will hide t
   }
 });
 
+// Show Private Key (with SAP verification)
 bot.action('show_private_key', async (ctx) => {
   try {
-    const disclaimerText =
-      `*Keep Your Private Key Secret*\n\n• Your Private Key provides full access to your wallet. Keep it safe!\n• Never share it with anyone.\n\nPress <b>Continue</b> to reveal your Private Key.`;
-    await ctx.editMessageText(disclaimerText, {
-      parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('❌ Cancel', 'back_to_settings'),
-         Markup.button.callback('Continue', 'confirm_show_private_key')]
-      ])
-    });
-    ctx.answerCbQuery();
+    const userId = ctx.from.id;
+    const userRef = db.collection('users').doc(userId.toString());
+    const userDoc = await userRef.get();
+    
+    if (!userDoc.exists || !userDoc.data().sap) {
+      await ctx.reply(
+        `🔒 <b>SAP Not Set</b>\n\nYou must set a Secure Action Password before viewing your private key.\n\nPlease set your SAP first in Settings.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    await ctx.editMessageText(
+      `⚠️ <b>Final Warning!</b>\n\nAre you sure you want to reveal your Private Key?\n\nOnce revealed, make sure to keep it safe and do not share it with anyone.`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('❌ Cancel', 'back_to_settings'),
+           Markup.button.callback('✅ Proceed', 'confirm_show_private_key')]
+        ])
+      }
+    );
+    await ctx.answerCbQuery();
   } catch (error) {
     console.error('❌ show_private_key Error:', error);
     await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
@@ -1600,30 +2069,85 @@ bot.action('show_private_key', async (ctx) => {
 
 bot.action('confirm_show_private_key', async (ctx) => {
   try {
-    const userId = ctx.from.id;
-    const activeWallet = await getActiveWallet(userId);
-    if (!activeWallet) {
-      return ctx.reply('❌ No active wallet found. Use /start to create or import a wallet.', { parse_mode: 'HTML' });
-    }
-    const storedPrivateKey = getLocalPrivateKey(activeWallet.id);
-    if (!storedPrivateKey) {
-      return ctx.reply('❌ Private key not available. Please import your wallet.', { parse_mode: 'HTML' });
-    }
-    const privateKeyMsg =
-      `<b>Your Private Key</b>\n\n<code>${storedPrivateKey}</code>\n\n⚠️ Never share this key with anyone.`;
-    await ctx.editMessageText(privateKeyMsg, {
-      parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('Done', 'back_to_settings')]
-      ])
-    });
-    ctx.answerCbQuery();
+    await requireSAPVerification(ctx, 'view private key');
+    await ctx.answerCbQuery();
   } catch (error) {
     console.error('❌ confirm_show_private_key Error:', error);
     await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
   }
 });
 
+// Set SAP
+bot.action('set_sap', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const userRef = db.collection('users').doc(userId.toString());
+    const userDoc = await userRef.get();
+    
+    if (userDoc.exists && userDoc.data().sap) {
+      await ctx.reply('❌ SAP already set. Use "Change SAP" to update it.', { parse_mode: 'HTML' });
+      return;
+    }
+    
+    ctx.session.awaitingNewSAP = true;
+const message = await ctx.reply(
+  `🔒 <b>Set Secure Action Password</b>\n\n` +
+  `Please create a strong password that:\n` +
+  `• Is at least ${SAP_MIN_LENGTH} characters long\n` +
+  `• Contains at least one number\n` +
+  `• Contains at least one special character (!@#$%^&*(),.?":{}|&lt;&gt;)\n\n` + // Halkan waxaa loo beddelay `<>` si Telegram u aqbalo
+  `This password will be required for sensitive actions such as:\n` +
+  `• Withdrawing funds from your wallet\n` +
+  `• Viewing your private key to safeguard your account\n\n` +
+  `Make sure this password is secure and unique. It is crucial for your account's security.\n\n` +
+  `⚠️ <b>Important Warning:</b> If you forget your Secure Action Password, you will not be able to perform sensitive actions, such as withdrawing your funds or viewing your private key. This password is vital for protecting your account and assets.\n\n` +
+  `<b>Make sure to store it safely!</b> If you lose it, we cannot help you recover it, and your funds will be inaccessible.\n\n` +
+  `<b>Please enter your password:</b>`,
+  { parse_mode: 'HTML' }
+);
+
+        
+    
+    // Store message ID for cleanup
+    ctx.session.sapSetupMessageId = message.message_id;
+    
+  } catch (error) {
+    console.error('❌ Set SAP Error:', error);
+    await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
+  }
+});
+
+// Change SAP
+bot.action('change_sap', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const userRef = db.collection('users').doc(userId.toString());
+    const userDoc = await userRef.get();
+    
+    if (!userDoc.exists || !userDoc.data().sap) {
+      await ctx.reply(
+        '❌ No SAP set. Use "Set SAP" to create one first.',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+    
+    ctx.session.awaitingCurrentSAP = true;
+    const message = await ctx.reply(
+      '🔒 <b>Change Secure Action Password</b>\n\nFirst, enter your current SAP:',
+      { parse_mode: 'HTML' }
+    );
+    
+    // Store message ID for cleanup
+    ctx.session.sapChangeMessageId = message.message_id;
+    
+  } catch (error) {
+    console.error('❌ Change SAP Error:', error);
+    await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
+  }
+});
+
+// Manage Wallet
 bot.action('manage_wallet', async (ctx) => {
   try {
     const userId = ctx.from.id;
@@ -1673,6 +2197,10 @@ bot.action('back_to_settings', async (ctx) => {
             Markup.button.callback('🗄️ Manage Wallet', 'manage_wallet')
           ],
           [
+            Markup.button.callback('🔒 Set SAP', 'set_sap'),
+            Markup.button.callback('🔄 Change SAP', 'change_sap')
+          ],
+          [
             Markup.button.callback('🚨 Reset Wallet', 'reset_wallet_prompt'),
             Markup.button.callback('🔙 Back to Main Menu', 'back_to_main')
           ]
@@ -1685,6 +2213,7 @@ bot.action('back_to_settings', async (ctx) => {
   }
 });
 
+// Reset Wallet Prompt
 bot.action('reset_wallet_prompt', async (ctx) => {
   try {
     await ctx.editMessageText(
@@ -1704,6 +2233,7 @@ bot.action('reset_wallet_prompt', async (ctx) => {
   }
 });
 
+// Reset Wallet Confirm
 bot.action('reset_wallet_confirm', async (ctx) => {
   try {
     await ctx.editMessageText(
@@ -1723,28 +2253,30 @@ bot.action('reset_wallet_confirm', async (ctx) => {
   }
 });
 
+// Reset Wallet Final (with SAP verification)
 bot.action('reset_wallet_final', async (ctx) => {
   try {
     const userId = ctx.from.id;
-    const newWallet = await resetWallet(userId);
-    await ctx.editMessageText(
-      `✅ <b>Wallet Reset Successful!</b>\n\nA brand-new wallet has been created.\n<b>New Address:</b> ${newWallet.publicKey}\n\nYour old wallet has been discarded. Type /start to continue.`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🔙 Back to Main Menu', callback_data: 'back_to_main' }]
-          ]
-        }
-      }
-    );
-    ctx.answerCbQuery();
+    const userRef = db.collection('users').doc(userId.toString());
+    const userDoc = await userRef.get();
+    
+    if (!userDoc.exists || !userDoc.data().sap) {
+      await ctx.reply(
+        `🔒 <b>SAP Not Set</b>\n\nYou must set a Secure Action Password before resetting your wallet.\n\nPlease set your SAP first in Settings.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+    
+    await requireSAPVerification(ctx, 'reset wallet');
+    await ctx.answerCbQuery();
   } catch (error) {
     console.error('❌ reset_wallet_final Error:', error);
     await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
   }
 });
 
+// Back to Main Menu
 bot.action('back_to_main', async (ctx) => {
   try {
     const userId = ctx.from.id;
