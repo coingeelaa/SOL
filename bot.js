@@ -1766,7 +1766,7 @@ bot.command('start', async (ctx) => {
     const balanceUSD = (balanceSOL * solPrice).toFixed(2);
 
     await ctx.reply(
-      `🚀 Welcome Back! ${greeting}\n\n👋 Active Wallet: I'm here to help you manage your Solana wallet.\n\nFaras on Solana – The fastest way to send, receive, and make local payments easily via Solana deposits. 🚀\n\nWallet SOLANA\n\nLet's get started! How would you like to trade today?\n\nWallet Address: ${activeWallet.publicKey}\n\nBalance: ${balanceSOL.toFixed(4)} SOL (~$${balanceUSD} USD)\n\nWhat would you like to do?`,
+      `🚀 Welcome Back! ${greeting}\n\nActive Wallet: I'm here to help you manage your Solana wallet.\n\nFaras on Solana – The fastest way to send, receive, and make local payments easily via Solana deposits. 🚀\n\nWallet SOLANA\n\nLet's get started! How would you like to trade today?\n\nWallet Address: ${activeWallet.publicKey}\n\nBalance: ${balanceSOL.toFixed(4)} SOL (~$${balanceUSD} USD)\n\nWhat would you like to do?`,
       {
         parse_mode: 'HTML',
         ...Markup.inlineKeyboard([
